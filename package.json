@@ -1,0 +1,14 @@
+{
+  "name": "relicone-spec",
+  "version": "1.0.0",
+  "description": "RelicONE Sealed Relic encryption format v1 — open specification and reference implementation.",
+  "license": "MIT",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "jsdom": "^30.0.1",
+    "typescript": "^5",
+    "vitest": "^3.2.7"
+  }
+}
