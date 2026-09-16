@@ -1,11 +1,20 @@
 /**
- * Reference implementation of the RelicONE Sealed Relic format v1 — see
+ * Reference implementation of the RelicONE Sealed Relic format — see
  * encryption-spec.md in this repository for the full specification. This
  * file must never send a passphrase or derived key anywhere; it only runs
  * in the browser.
+ *
+ * Two format versions exist. Version 1 (no AAD) is preserved forever,
+ * unchanged, because relics were already sealed under it before this
+ * distinction existed — redefining it in place would make them permanently
+ * undecryptable. Version 2 (header bound to the ciphertext as AES-GCM AAD)
+ * is what `sealText` writes going forward. See encryption-spec.md for the
+ * full rationale.
  */
 
-const FORMAT_VERSION = 1;
+const FORMAT_VERSION_V1_NO_AAD = 1;
+const FORMAT_VERSION_V2_AAD = 2;
+const CURRENT_FORMAT_VERSION = FORMAT_VERSION_V2_AAD;
 const PBKDF2_ITERATIONS = 600_000;
 const SALT_BYTES = 16;
 const IV_BYTES = 12;
@@ -72,7 +81,7 @@ export async function sealText(
   const key = await deriveKey(passphrase, salt, PBKDF2_ITERATIONS);
 
   const header = new Uint8Array(1 + 4 + SALT_BYTES + IV_BYTES);
-  header[0] = FORMAT_VERSION;
+  header[0] = CURRENT_FORMAT_VERSION;
   new DataView(header.buffer).setUint32(1, PBKDF2_ITERATIONS, false);
   header.set(salt, 5);
   header.set(iv, 5 + SALT_BYTES);
@@ -118,7 +127,10 @@ export async function unsealText(
   }
 
   const version = blob[0];
-  if (version !== FORMAT_VERSION) {
+  if (
+    version !== FORMAT_VERSION_V1_NO_AAD &&
+    version !== FORMAT_VERSION_V2_AAD
+  ) {
     throw new Error(`Unsupported sealed relic format version: ${version}`);
   }
 
@@ -141,12 +153,21 @@ export async function unsealText(
   const ciphertext = blob.slice(HEADER_LENGTH);
 
   const key = await deriveKey(passphrase, salt, iterations);
+  // v1 blobs were sealed with no AAD at all — passing `header` here for a
+  // v1 blob would fail the GCM tag check against a real v1 relic that was
+  // never sealed with it. v2 blobs must always pass it, or header tampering
+  // (version/iterations/salt/IV) would go undetected.
   const plaintext = await crypto.subtle.decrypt(
-    {
-      name: "AES-GCM",
-      iv: iv as BufferSource,
-      additionalData: header as BufferSource,
-    },
+    version === FORMAT_VERSION_V2_AAD
+      ? {
+          name: "AES-GCM",
+          iv: iv as BufferSource,
+          additionalData: header as BufferSource,
+        }
+      : {
+          name: "AES-GCM",
+          iv: iv as BufferSource,
+        },
     key,
     ciphertext as BufferSource,
   );
