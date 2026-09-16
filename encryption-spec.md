@@ -1,4 +1,4 @@
-# RelicONE — Sealed Relic Encryption Spec (v1)
+# RelicONE — Sealed Relic Encryption Spec
 
 > Open specification. Goal: anyone, at any time — even after the RelicONE
 > app or the company behind it is gone — can decrypt the content from an
@@ -12,9 +12,32 @@ library-agnostic — the format below can be implemented in any environment
 with a standard cryptographic library (Web Crypto, OpenSSL, libsodium via
 manual primitives, Node `crypto`, Python `cryptography`, ...).
 
+## Format versions
+
+Two versions of the blob format exist, distinguished by the version byte
+described below:
+
+- **Version 1** — the original format. The header (version, iterations,
+  salt, IV) sits next to the ciphertext but is **not** cryptographically
+  bound to it: AES-GCM is called with no additional authenticated data
+  (AAD). Preserved **permanently, unchanged** — relics were already sealed
+  under this format before version 2 existed, and redefining what version
+  1 means would make those relics permanently undecryptable. Any
+  implementation must keep decrypting version-1 blobs exactly as described
+  here, forever.
+- **Version 2** — the current format, and what `sealText` writes today.
+  Identical byte layout to version 1, but the header is passed to AES-GCM
+  as AAD, so tampering with the version byte, iteration count, salt, or IV
+  causes GCM's authentication tag check to fail by design, not merely as a
+  side effect of the header also feeding key derivation or the IV.
+
+A reader decrypting an existing relic must read the version byte first and
+follow the matching Unsealing path below — the two versions decrypt
+differently.
+
 ## Overview
 
-1. Content (v1: plain text, UTF-8) is encrypted **in the user's browser**,
+1. Content (plain text, UTF-8) is encrypted **in the user's browser**,
    before anything leaves the device.
 2. The encryption key is **derived from a user-supplied passphrase** via
    PBKDF2.
@@ -47,9 +70,11 @@ API) before being UTF-8-encoded. Every independent implementation must
 follow this step, or the recoverability this format promises does not
 hold.
 
-## Blob format (version 1)
+## Blob format (versions 1 and 2 — identical layout)
 
-The blob is a byte sequence uploaded to Arweave unmodified:
+The blob is a byte sequence uploaded to Arweave unmodified. Versions 1 and
+2 share exactly the same byte layout; only whether the header is used as
+AES-GCM AAD differs (see Sealing/Unsealing below).
 
 ```
 +----------+----------------+-------------+------------+------------------+
@@ -58,8 +83,9 @@ The blob is a byte sequence uploaded to Arweave unmodified:
 +----------+----------------+-------------+------------+------------------+
 ```
 
-- **version** (`uint8`) — `0x01` for this format. A future incompatible
-  format change increments this number.
+- **version** (`uint8`) — `0x01` (no AAD, preserved forever) or `0x02`
+  (AAD-bound, current default). Any other value is an unsupported/unknown
+  format.
 - **PBKDF2 iterations** (`uint32`, big-endian) — the exact iteration
   count used when this particular relic was sealed.
 - **salt** (16 random bytes) — PBKDF2 input, unique per relic.
@@ -74,29 +100,61 @@ passphrase.
 
 ## Sealing (encryption)
 
+Sealing always writes the **current** format, version 2.
+
 1. Generate a random 16-byte salt and a random 12-byte IV using a
    cryptographically secure generator (`crypto.getRandomValues` in the
    browser).
 2. Normalize the passphrase to Unicode NFC, then UTF-8-encode it.
 3. Derive a 256-bit key: `PBKDF2-HMAC-SHA256(NFC(passphrase), salt,
    600,000 iterations)`.
-4. Encrypt the UTF-8 bytes of the text with `AES-256-GCM(key, IV,
-   plaintext)` — no additional authenticated data (AAD).
-5. Assemble the blob per the format above: `version || iterations || salt
-   || IV || ciphertext`.
-6. Upload the blob as the content of an Arweave transaction.
+4. Assemble the 33-byte header per the format above: `0x02 || iterations
+   || salt || IV`.
+5. Encrypt the UTF-8 bytes of the text with `AES-256-GCM(key, IV,
+   plaintext)`, passing the assembled header as additional authenticated
+   data (AAD). This cryptographically binds the header to the ciphertext:
+   any tampering with the version byte, iteration count, salt, or IV
+   causes GCM's authentication tag check to fail by design, not merely as
+   a side effect of the header also feeding key derivation or the IV.
+6. Assemble the blob: `header || ciphertext` (i.e. `version || iterations
+   || salt || IV || ciphertext`).
+7. Upload the blob as the content of an Arweave transaction.
+
+Version 1 is never written by current sealing code. It exists in this
+spec only because relics sealed before version 2 existed must remain
+decryptable — see Unsealing below.
 
 ## Unsealing (decryption) — independent of the app
 
 1. Download the Arweave transaction's content
    (`https://arweave.net/<tx-id>` or any other Arweave gateway).
-2. Read the first byte — must be `0x01`.
+2. Read the first byte — the **version**. Must be `0x01` or `0x02`;
+   anything else is an unsupported format and decryption must stop here.
 3. Read the next 4 bytes as a big-endian `uint32` — the iteration count.
 4. Read the next 16 bytes as the salt, the next 12 bytes as the IV.
-5. The rest of the blob is the ciphertext (including the GCM tag).
+5. The rest of the blob is the ciphertext (including the GCM tag). The
+   first 33 bytes read in steps 2–4 (version || iterations || salt || IV)
+   are the header.
 6. Derive the key the same way as during sealing (passphrase normalized
    to NFC), using the salt and iteration count read from the blob.
-7. Decrypt `AES-256-GCM(key, IV, ciphertext)` → UTF-8 plaintext.
+7. Decrypt `AES-256-GCM(key, IV, ciphertext)` → UTF-8 plaintext, branching
+   on the version byte read in step 2:
+   - **Version 1** — decrypt with **no** additional authenticated data.
+     This is the original format's exact behavior, preserved forever so
+     relics sealed under it keep decrypting. The header is *not*
+     cryptographically bound to the ciphertext for these relics; only the
+     wrong-passphrase/wrong-IV/wrong-salt side effects of GCM happen to
+     make gross header tampering fail, not an explicit guarantee.
+   - **Version 2** — decrypt **with** the 33-byte header from step 5 as
+     AAD, the same value used during sealing. If the header was tampered
+     with after sealing (or doesn't match the ciphertext for any other
+     reason), GCM's authentication check fails and decryption throws, by
+     design.
+
+   Passing the wrong AAD mode for a given version (e.g. treating a
+   version-1 blob as if it were AAD-bound) will make decryption of a
+   validly-sealed relic fail — the branch on the version byte is not
+   optional.
 
 The reference implementation of both directions (`sealText`/`unsealText`)
 lives in [`crypto.ts`](./crypto.ts) and uses only the Web Crypto API — no
