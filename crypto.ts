@@ -71,19 +71,23 @@ export async function sealText(
   const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
   const key = await deriveKey(passphrase, salt, PBKDF2_ITERATIONS);
 
-  const ciphertext = new Uint8Array(
-    await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv: iv as BufferSource },
-      key,
-      new TextEncoder().encode(plaintext),
-    ),
-  );
-
   const header = new Uint8Array(1 + 4 + SALT_BYTES + IV_BYTES);
   header[0] = FORMAT_VERSION;
   new DataView(header.buffer).setUint32(1, PBKDF2_ITERATIONS, false);
   header.set(salt, 5);
   header.set(iv, 5 + SALT_BYTES);
+
+  const ciphertext = new Uint8Array(
+    await crypto.subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv: iv as BufferSource,
+        additionalData: header as BufferSource,
+      },
+      key,
+      new TextEncoder().encode(plaintext),
+    ),
+  );
 
   const blob = new Uint8Array(header.length + ciphertext.length);
   blob.set(header, 0);
@@ -131,13 +135,18 @@ export async function unsealText(
     throw new Error("This isn't a valid sealed relic — its iteration count is implausible.");
   }
 
+  const header = blob.slice(0, HEADER_LENGTH);
   const salt = blob.slice(5, 5 + SALT_BYTES);
   const iv = blob.slice(5 + SALT_BYTES, 5 + SALT_BYTES + IV_BYTES);
   const ciphertext = blob.slice(HEADER_LENGTH);
 
   const key = await deriveKey(passphrase, salt, iterations);
   const plaintext = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: iv as BufferSource },
+    {
+      name: "AES-GCM",
+      iv: iv as BufferSource,
+      additionalData: header as BufferSource,
+    },
     key,
     ciphertext as BufferSource,
   );
