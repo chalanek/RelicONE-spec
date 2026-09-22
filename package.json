@@ -1,12 +1,17 @@
 {
   "name": "relicone-spec",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "RelicONE Sealed Relic encryption format v1 — open specification and reference implementation.",
   "license": "MIT",
+  "type": "module",
+  "bin": {
+    "relicone-decrypt": "./relicone-decrypt.ts"
+  },
   "scripts": {
     "test": "vitest run"
   },
   "devDependencies": {
+    "@types/node": "^26.6.2",
     "jsdom": "^30.0.1",
     "typescript": "^5",
     "vitest": "^3.2.7"

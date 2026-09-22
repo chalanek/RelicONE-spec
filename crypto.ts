@@ -28,7 +28,7 @@ const GCM_TAG_BYTES = 16;
 const MAX_PLAUSIBLE_PBKDF2_ITERATIONS = 5_000_000;
 
 function assertBrowserCrypto() {
-  if (typeof window === "undefined" || !window.crypto?.subtle) {
+  if (typeof globalThis.crypto?.subtle?.decrypt !== "function") {
     throw new Error("Web Crypto API is not available in this environment");
   }
 }
