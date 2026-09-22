@@ -37,10 +37,14 @@ node relicone-decrypt.ts ./relic.bin
 node relicone-decrypt.ts <transaction-id> --out relic.txt
 ```
 
-Runs under plain `node` — no `ts-node`, `tsx`, or build step. The
-passphrase is always requested interactively, with input hidden; it is
-never accepted as a command-line argument, since that would leak into
-shell history and be visible to `ps` on a shared machine.
+Runs under plain `node` — no `ts-node`, `tsx`, or build step — on
+**Node.js 22.18.0 or later**, where TypeScript type stripping is enabled
+by default. On Node 22.6.0–22.17.x, pass `--experimental-strip-types`
+explicitly (`node --experimental-strip-types relicone-decrypt.ts
+<transaction-id>`); Node 20.x cannot run `.ts` files directly at all.
+The passphrase is always requested interactively, with input hidden; it
+is never accepted as a command-line argument, since that would leak
+into shell history and be visible to `ps` on a shared machine.
 
 Run the tests yourself:
 
