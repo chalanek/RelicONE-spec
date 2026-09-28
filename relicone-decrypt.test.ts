@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { sealText } from "./crypto";
+import { sealMultiKey, sealText } from "./crypto";
 import { parseArgs, resolveBlob, run } from "./relicone-decrypt";
 
 const PASSPHRASE = "correct horse battery staple";
@@ -135,6 +135,74 @@ describe("run (decrypt-from-file path, in-process)", () => {
   });
 });
 
+describe("run (multi-key / version-3 path, in-process)", () => {
+  const participants = [
+    { label: "Alice", passphrase: "alice passphrase here" },
+    { label: "Bob", passphrase: "bob passphrase here" },
+    { label: "Carol", passphrase: "carol passphrase here" },
+  ];
+
+  it("decrypts once threshold participants' passphrases are entered, without asking the rest", async () => {
+    const blob = await sealMultiKey(PLAINTEXT, participants, 2);
+    const filePath = join(dir, "relic.bin");
+    writeFileSync(filePath, blob);
+
+    const promptPassphraseImpl = vi.fn(async (promptText?: string) => {
+      const participant = participants.find((p) => promptText?.includes(p.label));
+      return participant?.passphrase ?? "";
+    });
+
+    const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await run([filePath], { promptPassphraseImpl });
+      expect(writeSpy).toHaveBeenCalledWith(PLAINTEXT);
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    // Threshold is 2 (Alice, then Bob) — Carol is never even asked.
+    expect(promptPassphraseImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports a wrong passphrase for one participant by label and still succeeds with the rest", async () => {
+    const blob = await sealMultiKey(PLAINTEXT, participants, 2);
+    const filePath = join(dir, "relic.bin");
+    writeFileSync(filePath, blob);
+
+    const promptPassphraseImpl = vi.fn(async (promptText?: string) => {
+      if (promptText?.includes("Alice")) return "not alice's real passphrase";
+      const participant = participants.find((p) => promptText?.includes(p.label));
+      return participant?.passphrase ?? "";
+    });
+
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await run([filePath], { promptPassphraseImpl });
+      expect(writeSpy).toHaveBeenCalledWith(PLAINTEXT);
+      expect(stderrSpy.mock.calls.flat().join("")).toMatch(/wrong passphrase for "Alice"/);
+    } finally {
+      writeSpy.mockRestore();
+      stderrSpy.mockRestore();
+    }
+
+    // Alice (wrong), Bob (correct), Carol (correct) — threshold 2 reached at Carol.
+    expect(promptPassphraseImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it("throws a clear error, without guessing which passphrase was the problem, when fewer than the threshold are entered correctly", async () => {
+    const blob = await sealMultiKey(PLAINTEXT, participants.slice(0, 2), 2);
+    const filePath = join(dir, "relic.bin");
+    writeFileSync(filePath, blob);
+
+    const promptPassphraseImpl = vi.fn(async () => "");
+
+    await expect(run([filePath], { promptPassphraseImpl })).rejects.toThrow(
+      /Only 0 of the required 2 passphrases were entered correctly/,
+    );
+  });
+});
+
 describe("CLI end-to-end under plain `node` (subprocess)", () => {
   it("runs relicone-decrypt.ts directly with `node`, decrypting a local file with a piped, hidden passphrase", async () => {
     const sealed = await sealText(PLAINTEXT, PASSPHRASE);
@@ -163,6 +231,81 @@ describe("CLI end-to-end under plain `node` (subprocess)", () => {
     });
 
     expect(readFileSync(outPath, "utf8")).toBe(PLAINTEXT);
+  });
+
+  it("decrypts a multi-key relic with several piped, sequential passphrases", async () => {
+    // Regression coverage for a real bug: creating a fresh readline
+    // interface per promptPassphrase() call (the original implementation)
+    // silently dropped every line after the first when a piped stdin
+    // delivered multiple newline-terminated lines in a single "data" event
+    // — exactly what `printf 'a\nb\n' | …` does. A multi-key relic is the
+    // first real caller that needs more than one prompt in a row.
+    const blob = await sealMultiKey(
+      PLAINTEXT,
+      [
+        { label: "Alice", passphrase: "alice passphrase here" },
+        { label: "Bob", passphrase: "bob passphrase here" },
+      ],
+      2,
+    );
+    const filePath = join(dir, "relic.bin");
+    writeFileSync(filePath, blob);
+
+    const stdout = execFileSync(process.execPath, [CLI_PATH, filePath], {
+      input: "alice passphrase here\nbob passphrase here\n",
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    expect(stdout).toBe(PLAINTEXT);
+  });
+
+  it("decrypts a multi-key relic even when the final piped line has no trailing newline", async () => {
+    // Regression coverage for a second real bug, found in review: the
+    // hand-rolled line buffer that fixed the test above introduced a new
+    // failure in the opposite direction — a final line with no trailing
+    // "\n" (the common case for the last passphrase in a script, heredoc,
+    // or piped password-manager output) was left stranded in the buffer
+    // and never surfaced, silently read as "skipped" rather than "wrong".
+    // Fixed by reading stdin through a single persistent readline.Interface
+    // via its async-iterator protocol, which flushes a final unterminated
+    // line as its last iteration result at EOF.
+    const blob = await sealMultiKey(
+      PLAINTEXT,
+      [
+        { label: "Alice", passphrase: "alice passphrase here" },
+        { label: "Bob", passphrase: "bob passphrase here" },
+      ],
+      2,
+    );
+    const filePath = join(dir, "relic.bin");
+    writeFileSync(filePath, blob);
+
+    const stdout = execFileSync(process.execPath, [CLI_PATH, filePath], {
+      // No trailing "\n" after Bob's passphrase — this is the whole point.
+      input: "alice passphrase here\nbob passphrase here",
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    expect(stdout).toBe(PLAINTEXT);
+  });
+
+  it("decrypts a single-passphrase relic even when the piped line has no trailing newline", async () => {
+    // Same root cause as above, on the plain v1/v2 path: unsealText was
+    // getting an empty string instead of the real passphrase and failing
+    // with a generic WebCrypto error rather than actually decrypting.
+    const sealed = await sealText(PLAINTEXT, PASSPHRASE);
+    const filePath = join(dir, "relic.bin");
+    writeFileSync(filePath, sealed);
+
+    const stdout = execFileSync(process.execPath, [CLI_PATH, filePath], {
+      input: PASSPHRASE, // no trailing "\n"
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    expect(stdout).toBe(PLAINTEXT);
   });
 
   it("exits non-zero with a clear message on the wrong passphrase", async () => {
