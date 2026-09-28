@@ -247,59 +247,69 @@ export async function sealMultiKey(
   const shares = await split(cek, participants.length, threshold);
 
   const participantCount = participants.length;
-  const recordBytesList: Uint8Array[] = [];
 
-  for (let i = 0; i < participantCount; i++) {
-    const labelBytes = new TextEncoder().encode(participants[i].label);
-    if (labelBytes.length > 255) {
-      throw new Error(`Participant label "${participants[i].label}" is too long.`);
-    }
+  // Each participant's record depends only on their own passphrase/label/
+  // share — nothing here depends on any other participant's work — so
+  // these run concurrently via Promise.all rather than a sequential for
+  // loop. With the UI-permitted max of 10 participants, that's the
+  // difference between ~10 PBKDF2 derivations back to back and ~1
+  // derivation's worth of wall-clock time. Promise.all preserves result
+  // order to match `participants`/`shares`, regardless of which
+  // derivation happens to finish first.
+  const recordBytesList = await Promise.all(
+    participants.map(async (participant, i) => {
+      const labelBytes = new TextEncoder().encode(participant.label);
+      if (labelBytes.length > 255) {
+        throw new Error(`Participant label "${participant.label}" is too long.`);
+      }
 
-    const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
-    const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
-    const key = await deriveKey(participants[i].passphrase, salt, PBKDF2_ITERATIONS);
+      const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
+      const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
+      const key = await deriveKey(participant.passphrase, salt, PBKDF2_ITERATIONS);
 
-    // Everything fixed-position about this one record — see the "wrapped
-    // share" row of the byte-layout table in
-    // docs/multi-key-encryption-spec.md for why this exact slice is used
-    // as AAD, both here and when unwrapping.
-    const recordHeader = new Uint8Array(
-      LABEL_LENGTH_BYTES + labelBytes.length + PARTICIPANT_RECORD_FIXED_BYTES,
-    );
-    recordHeader[0] = labelBytes.length;
-    recordHeader.set(labelBytes, LABEL_LENGTH_BYTES);
-    new DataView(recordHeader.buffer).setUint32(
-      LABEL_LENGTH_BYTES + labelBytes.length,
-      PBKDF2_ITERATIONS,
-      false,
-    );
-    recordHeader.set(salt, LABEL_LENGTH_BYTES + labelBytes.length + 4);
-    recordHeader.set(iv, LABEL_LENGTH_BYTES + labelBytes.length + 4 + SALT_BYTES);
+      // Everything fixed-position about this one record — see the
+      // "wrapped share" row of the byte-layout table in
+      // docs/multi-key-encryption-spec.md for why this exact slice is
+      // used as AAD, both here and when unwrapping.
+      const recordHeader = new Uint8Array(
+        LABEL_LENGTH_BYTES + labelBytes.length + PARTICIPANT_RECORD_FIXED_BYTES,
+      );
+      recordHeader[0] = labelBytes.length;
+      recordHeader.set(labelBytes, LABEL_LENGTH_BYTES);
+      new DataView(recordHeader.buffer).setUint32(
+        LABEL_LENGTH_BYTES + labelBytes.length,
+        PBKDF2_ITERATIONS,
+        false,
+      );
+      recordHeader.set(salt, LABEL_LENGTH_BYTES + labelBytes.length + 4);
+      recordHeader.set(iv, LABEL_LENGTH_BYTES + labelBytes.length + 4 + SALT_BYTES);
 
-    const aad = new Uint8Array(MULTI_KEY_FIXED_HEADER_BYTES + recordHeader.length);
-    aad[0] = FORMAT_VERSION_V3_MULTI_KEY;
-    aad[1] = participantCount;
-    aad[2] = threshold;
-    aad.set(recordHeader, MULTI_KEY_FIXED_HEADER_BYTES);
+      const aad = new Uint8Array(MULTI_KEY_FIXED_HEADER_BYTES + recordHeader.length);
+      aad[0] = FORMAT_VERSION_V3_MULTI_KEY;
+      aad[1] = participantCount;
+      aad[2] = threshold;
+      aad.set(recordHeader, MULTI_KEY_FIXED_HEADER_BYTES);
 
-    const wrappedShare = new Uint8Array(
-      await crypto.subtle.encrypt(
-        { name: "AES-GCM", iv: iv as BufferSource, additionalData: aad as BufferSource },
-        key,
-        shares[i] as BufferSource,
-      ),
-    );
+      const wrappedShare = new Uint8Array(
+        await crypto.subtle.encrypt(
+          { name: "AES-GCM", iv: iv as BufferSource, additionalData: aad as BufferSource },
+          key,
+          shares[i] as BufferSource,
+        ),
+      );
 
-    const record = new Uint8Array(
-      recordHeader.length + WRAPPED_SHARE_LENGTH_BYTES + wrappedShare.length,
-    );
-    record.set(recordHeader, 0);
-    new DataView(record.buffer).setUint16(recordHeader.length, wrappedShare.length, false);
-    record.set(wrappedShare, recordHeader.length + WRAPPED_SHARE_LENGTH_BYTES);
-    recordBytesList.push(record);
+      const record = new Uint8Array(
+        recordHeader.length + WRAPPED_SHARE_LENGTH_BYTES + wrappedShare.length,
+      );
+      record.set(recordHeader, 0);
+      new DataView(record.buffer).setUint16(recordHeader.length, wrappedShare.length, false);
+      record.set(wrappedShare, recordHeader.length + WRAPPED_SHARE_LENGTH_BYTES);
 
-    shares[i].fill(0);
-  }
+      shares[i].fill(0);
+
+      return record;
+    }),
+  );
 
   const recordsTotalBytes = recordBytesList.reduce((sum, r) => sum + r.length, 0);
   const header = new Uint8Array(MULTI_KEY_FIXED_HEADER_BYTES + recordsTotalBytes + IV_BYTES);
