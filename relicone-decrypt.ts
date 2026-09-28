@@ -2,22 +2,31 @@
 /**
  * Offline CLI decryptor for RelicONE Sealed Relics — concrete proof that a
  * relic is decryptable without the app, the company, or this repository:
- * this file plus crypto.ts and a passphrase is everything it takes.
+ * this file plus crypto.ts and a passphrase (or, for a multi-key relic, M
+ * of N participants' passphrases) is everything it takes.
  *
  * Usage:
  *   node relicone-decrypt.ts <transaction-id-or-file-path> [--out <file>]
  *
  * The positional argument is either an Arweave transaction id (fetched from
  * a public gateway) or a path to a local file already holding the sealed
- * relic's raw bytes. The passphrase is always requested interactively, with
- * input hidden — it is never accepted as a command-line argument, since that
+ * relic's raw bytes. Every passphrase is always requested interactively,
+ * with input hidden — never accepted as a command-line argument, since that
  * would leak into shell history and be visible to `ps` on a shared machine.
+ *
+ * A version-3 (multi-key, M-of-N) relic prompts once per participant, in
+ * order, stopping as soon as enough passphrases have been entered
+ * correctly — see multi-key-encryption-spec.md.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 
-import { unsealText } from "./crypto.ts";
+import {
+  readMultiKeyParticipants,
+  unsealMultiKey,
+  unsealText,
+  unwrapMultiKeyShare,
+} from "./crypto.ts";
 
 const DEFAULT_GATEWAY = "https://arweave.net";
 
@@ -77,12 +86,73 @@ export async function resolveBlob(
   return new Uint8Array(await response.arrayBuffer());
 }
 
+// Non-TTY (piped) stdin line reader, shared across every promptPassphrase()
+// call in the process — a multi-key relic needs up to N sequential prompts
+// (see decryptMultiKey below), and `readline.createInterface` reads and
+// internally buffers *all* currently-available bytes from the stream the
+// moment it's created, not just up to the next newline. A fresh interface
+// per call (the previous approach) silently discarded every line after the
+// first: the first interface would consume the whole piped input into its
+// own internal buffer, emit one "line", and then get closed — taking any
+// already-buffered second/third line with it, with no error and no way for
+// a second interface created afterward to recover them. Tracking the raw
+// buffer ourselves, once, sidesteps that entirely.
+let stdinLineBuffer = "";
+let stdinEnded = false;
+let stdinListenerAttached = false;
+// A piped stdin can deliver several already-newline-terminated lines in one
+// "data" event (e.g. `printf 'a\nb\n' | …` — both lines arrive in a single
+// chunk). Any line extracted before its corresponding readNextStdinLine()
+// call has actually been made (no pending resolver yet) must be queued, not
+// dropped — otherwise a second/third prompt's answer, delivered early,
+// would be silently lost the moment nothing was there yet to hand it to.
+const queuedStdinLines: string[] = [];
+const pendingStdinLineResolvers: Array<(line: string | null) => void> = [];
+
+function ensureStdinLineListener() {
+  if (stdinListenerAttached) return;
+  stdinListenerAttached = true;
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk: string) => {
+    stdinLineBuffer += chunk;
+    let newlineIndex: number;
+    while ((newlineIndex = stdinLineBuffer.indexOf("\n")) !== -1) {
+      const line = stdinLineBuffer.slice(0, newlineIndex).replace(/\r$/, "");
+      stdinLineBuffer = stdinLineBuffer.slice(newlineIndex + 1);
+      const resolver = pendingStdinLineResolvers.shift();
+      if (resolver) resolver(line);
+      else queuedStdinLines.push(line);
+    }
+  });
+  process.stdin.on("end", () => {
+    stdinEnded = true;
+    while (pendingStdinLineResolvers.length > 0) {
+      pendingStdinLineResolvers.shift()?.(null);
+    }
+  });
+}
+
+/** Resolves with the next line from piped stdin, or `null` at EOF. */
+function readNextStdinLine(): Promise<string | null> {
+  ensureStdinLineListener();
+  if (queuedStdinLines.length > 0) {
+    return Promise.resolve(queuedStdinLines.shift()!);
+  }
+  if (stdinEnded) {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    pendingStdinLineResolvers.push(resolve);
+    process.stdin.resume();
+  });
+}
+
 /**
  * Reads a passphrase from stdin with input hidden. On a real TTY, keystrokes
  * are suppressed and handled a character at a time (so backspace works)
  * without depending on any undocumented readline internals. When stdin isn't
- * a TTY (piped input, as in tests or CI), falls back to a plain line read —
- * there's no terminal to hide echo from anyway.
+ * a TTY (piped input, as in tests, CI, or scripted multi-key input), falls
+ * back to a plain line read — there's no terminal to hide echo from anyway.
  */
 export function promptPassphrase(promptText = "Passphrase: "): Promise<string> {
   // The prompt and its trailing newline go to stderr, never stdout — stdout
@@ -92,13 +162,7 @@ export function promptPassphrase(promptText = "Passphrase: "): Promise<string> {
   stderr.write(promptText);
 
   if (!stdin.isTTY) {
-    return new Promise((resolve) => {
-      const rl = createInterface({ input: stdin });
-      rl.once("line", (line) => {
-        rl.close();
-        resolve(line);
-      });
-    });
+    return readNextStdinLine().then((line) => line ?? "");
   }
 
   return new Promise((resolve, reject) => {
@@ -140,6 +204,49 @@ export function promptPassphrase(promptText = "Passphrase: "): Promise<string> {
   });
 }
 
+/**
+ * Decrypts a version-3 (multi-key) blob, prompting once per participant in
+ * order and stopping as soon as `threshold` of them have been entered
+ * correctly. A wrong passphrase for one participant is reported by label
+ * and doesn't block trying the rest — see multi-key-encryption-spec.md's
+ * "layered verification" property. If every participant has been asked and
+ * the threshold still isn't met, throws rather than hanging or guessing.
+ */
+async function decryptMultiKey(
+  blob: Uint8Array,
+  promptPassphraseImpl: typeof promptPassphrase,
+): Promise<string> {
+  const { threshold, participants } = readMultiKeyParticipants(blob);
+  process.stderr.write(
+    `Multi-key relic: ${threshold} of ${participants.length} participants' passphrases are needed together.\n`,
+  );
+
+  const shares: Uint8Array[] = [];
+  for (const participant of participants) {
+    if (shares.length >= threshold) break;
+
+    const passphrase = await promptPassphraseImpl(
+      `Passphrase for "${participant.label}" (Enter to skip): `,
+    );
+    if (!passphrase) continue;
+
+    try {
+      shares.push(await unwrapMultiKeyShare(blob, participant.index, passphrase));
+      process.stderr.write(`  unlocked "${participant.label}" (${shares.length}/${threshold})\n`);
+    } catch {
+      process.stderr.write(`  wrong passphrase for "${participant.label}"\n`);
+    }
+  }
+
+  if (shares.length < threshold) {
+    throw new Error(
+      `Only ${shares.length} of the required ${threshold} passphrases were entered correctly.`,
+    );
+  }
+
+  return unsealMultiKey(blob, shares);
+}
+
 export async function run(
   argv: string[],
   deps: {
@@ -152,8 +259,10 @@ export async function run(
   const promptPassphraseImpl = deps.promptPassphraseImpl ?? promptPassphrase;
 
   const blob = await resolveBlob(input, fetchImpl);
-  const passphrase = await promptPassphraseImpl();
-  const plaintext = await unsealText(blob, passphrase);
+  const plaintext =
+    blob[0] === 3
+      ? await decryptMultiKey(blob, promptPassphraseImpl)
+      : await unsealText(blob, await promptPassphraseImpl());
 
   if (outFile) {
     writeFileSync(outFile, plaintext, "utf8");

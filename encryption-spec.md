@@ -35,6 +35,14 @@ A reader decrypting an existing relic must read the version byte first and
 follow the matching Unsealing path below — the two versions decrypt
 differently.
 
+**A third format, version 3, exists but is documented separately:**
+[`multi-key-encryption-spec.md`](./multi-key-encryption-spec.md) specifies
+a distinct M-of-N multi-passphrase format (Shamir's Secret Sharing) with
+its own variable-length header — a different track, not a later revision
+of the single-passphrase format below. A reader must still check the
+version byte first; `0x01`/`0x02` mean this document applies, `0x03` means
+the sibling document does.
+
 ## Overview
 
 1. Content (plain text, UTF-8) is encrypted **in the user's browser**,
