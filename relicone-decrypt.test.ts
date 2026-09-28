@@ -260,6 +260,54 @@ describe("CLI end-to-end under plain `node` (subprocess)", () => {
     expect(stdout).toBe(PLAINTEXT);
   });
 
+  it("decrypts a multi-key relic even when the final piped line has no trailing newline", async () => {
+    // Regression coverage for a second real bug, found in review: the
+    // hand-rolled line buffer that fixed the test above introduced a new
+    // failure in the opposite direction — a final line with no trailing
+    // "\n" (the common case for the last passphrase in a script, heredoc,
+    // or piped password-manager output) was left stranded in the buffer
+    // and never surfaced, silently read as "skipped" rather than "wrong".
+    // Fixed by reading stdin through a single persistent readline.Interface
+    // via its async-iterator protocol, which flushes a final unterminated
+    // line as its last iteration result at EOF.
+    const blob = await sealMultiKey(
+      PLAINTEXT,
+      [
+        { label: "Alice", passphrase: "alice passphrase here" },
+        { label: "Bob", passphrase: "bob passphrase here" },
+      ],
+      2,
+    );
+    const filePath = join(dir, "relic.bin");
+    writeFileSync(filePath, blob);
+
+    const stdout = execFileSync(process.execPath, [CLI_PATH, filePath], {
+      // No trailing "\n" after Bob's passphrase — this is the whole point.
+      input: "alice passphrase here\nbob passphrase here",
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    expect(stdout).toBe(PLAINTEXT);
+  });
+
+  it("decrypts a single-passphrase relic even when the piped line has no trailing newline", async () => {
+    // Same root cause as above, on the plain v1/v2 path: unsealText was
+    // getting an empty string instead of the real passphrase and failing
+    // with a generic WebCrypto error rather than actually decrypting.
+    const sealed = await sealText(PLAINTEXT, PASSPHRASE);
+    const filePath = join(dir, "relic.bin");
+    writeFileSync(filePath, sealed);
+
+    const stdout = execFileSync(process.execPath, [CLI_PATH, filePath], {
+      input: PASSPHRASE, // no trailing "\n"
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    expect(stdout).toBe(PLAINTEXT);
+  });
+
   it("exits non-zero with a clear message on the wrong passphrase", async () => {
     const sealed = await sealText(PLAINTEXT, PASSPHRASE);
     const filePath = join(dir, "relic.bin");

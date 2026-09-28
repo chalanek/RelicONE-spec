@@ -19,6 +19,7 @@
  * correctly — see multi-key-encryption-spec.md.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { createInterface, type Interface } from "node:readline";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -88,63 +89,38 @@ export async function resolveBlob(
 
 // Non-TTY (piped) stdin line reader, shared across every promptPassphrase()
 // call in the process — a multi-key relic needs up to N sequential prompts
-// (see decryptMultiKey below), and `readline.createInterface` reads and
+// (see decryptMultiKey below).
+//
+// A fresh `readline.createInterface` per call is wrong: it reads and
 // internally buffers *all* currently-available bytes from the stream the
-// moment it's created, not just up to the next newline. A fresh interface
-// per call (the previous approach) silently discarded every line after the
-// first: the first interface would consume the whole piped input into its
-// own internal buffer, emit one "line", and then get closed — taking any
-// already-buffered second/third line with it, with no error and no way for
-// a second interface created afterward to recover them. Tracking the raw
-// buffer ourselves, once, sidesteps that entirely.
-let stdinLineBuffer = "";
-let stdinEnded = false;
-let stdinListenerAttached = false;
-// A piped stdin can deliver several already-newline-terminated lines in one
-// "data" event (e.g. `printf 'a\nb\n' | …` — both lines arrive in a single
-// chunk). Any line extracted before its corresponding readNextStdinLine()
-// call has actually been made (no pending resolver yet) must be queued, not
-// dropped — otherwise a second/third prompt's answer, delivered early,
-// would be silently lost the moment nothing was there yet to hand it to.
-const queuedStdinLines: string[] = [];
-const pendingStdinLineResolvers: Array<(line: string | null) => void> = [];
-
-function ensureStdinLineListener() {
-  if (stdinListenerAttached) return;
-  stdinListenerAttached = true;
-  process.stdin.setEncoding("utf8");
-  process.stdin.on("data", (chunk: string) => {
-    stdinLineBuffer += chunk;
-    let newlineIndex: number;
-    while ((newlineIndex = stdinLineBuffer.indexOf("\n")) !== -1) {
-      const line = stdinLineBuffer.slice(0, newlineIndex).replace(/\r$/, "");
-      stdinLineBuffer = stdinLineBuffer.slice(newlineIndex + 1);
-      const resolver = pendingStdinLineResolvers.shift();
-      if (resolver) resolver(line);
-      else queuedStdinLines.push(line);
-    }
-  });
-  process.stdin.on("end", () => {
-    stdinEnded = true;
-    while (pendingStdinLineResolvers.length > 0) {
-      pendingStdinLineResolvers.shift()?.(null);
-    }
-  });
-}
+// moment it's created, not just up to the next newline, so a second/third
+// already-buffered line gets silently discarded when that first interface
+// is closed after its one "line" event.
+//
+// A hand-rolled buffer split on "\n" (an earlier version of this file) is
+// *also* wrong, in the opposite direction: it drops a final line that has
+// no trailing newline. That's not a corner case here — it's the common
+// case for the last passphrase in a script, heredoc, or piped password-
+// manager output with no trailing newline, and dropping it means the very
+// last participant's correct passphrase reads as silently "skipped", not
+// "wrong" (verified — see relicone-decrypt.test.ts).
+//
+// A single, persistent `readline.Interface`, consumed one line at a time
+// through its async-iterator protocol, gets both right: it queues lines
+// internally regardless of how many arrive in one "data" event, *and*
+// flushes a final unterminated line as its last iteration result at EOF —
+// exactly the guarantee this file needs and neither alternative provides.
+let sharedStdinInterface: Interface | null = null;
+let sharedStdinLines: AsyncIterator<string> | null = null;
 
 /** Resolves with the next line from piped stdin, or `null` at EOF. */
-function readNextStdinLine(): Promise<string | null> {
-  ensureStdinLineListener();
-  if (queuedStdinLines.length > 0) {
-    return Promise.resolve(queuedStdinLines.shift()!);
+async function readNextStdinLine(): Promise<string | null> {
+  if (!sharedStdinLines) {
+    sharedStdinInterface = createInterface({ input: process.stdin });
+    sharedStdinLines = sharedStdinInterface[Symbol.asyncIterator]();
   }
-  if (stdinEnded) {
-    return Promise.resolve(null);
-  }
-  return new Promise((resolve) => {
-    pendingStdinLineResolvers.push(resolve);
-    process.stdin.resume();
-  });
+  const result = await sharedStdinLines.next();
+  return result.done ? null : result.value;
 }
 
 /**
