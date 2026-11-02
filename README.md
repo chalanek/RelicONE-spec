@@ -5,13 +5,15 @@ RelicONE — a permanent, decentralized, encrypted vault built on Arweave.
 Client-side AES-256-GCM with a PBKDF2-derived key, designed so a sealed
 relic stays decryptable without the app, the company behind it, or this
 repository — using only the format below and a standard cryptographic
-library. Two formats exist: the original single-passphrase format
-(versions 1/2) and a multi-key, M-of-N format (version 3) built on
+library. Three formats exist: the original single-passphrase text format
+(versions 1/2), a multi-key, M-of-N format (version 3) built on
 Shamir's Secret Sharing, where any M of N participants' own passphrases
-together unlock a relic that no fewer than M reveal anything about.
+together unlock a relic that no fewer than M reveal anything about, and a
+file format (version 4) that seals one image, audio clip or other file
+with the same header and AAD binding as version 2.
 
 - [`encryption-spec.md`](./encryption-spec.md) — the full single-passphrase
-  specification (v1/v2): primitives, the exact byte layout, and the
+  specification (v1/v2 text, plus v4 files): primitives, the exact byte layout, and the
   sealing/unsealing procedures.
 - [`multi-key-encryption-spec.md`](./multi-key-encryption-spec.md) — the
   multi-key (M-of-N, v3) specification, a distinct byte format sibling to
