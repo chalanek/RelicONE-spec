@@ -20,12 +20,22 @@
  * separate track, not a revision of versions 1/2: see
  * docs/multi-key-encryption-spec.md for its own full specification.
  * `sealText`/`unsealText` above are untouched by it.
+ *
+ * A fourth format, version 4, seals one non-text file (image, audio, any
+ * bytes) — `sealArtifact`/`unsealArtifact` at the bottom of this file. It
+ * reuses version 2's exact header and AAD binding; only what "plaintext"
+ * means changes (a small self-describing envelope: mime type, file name,
+ * raw bytes). See docs/encryption-spec.md, "Version 4". This file is kept
+ * self-contained on purpose (no imports from other src/lib modules): it is
+ * mirrored code-for-code into the public RelicONE-spec repo (see
+ * scripts/check-crypto-spec-sync.mjs).
  */
 
 import { combine, split } from "shamir-secret-sharing";
 
 const FORMAT_VERSION_V1_NO_AAD = 1;
 const FORMAT_VERSION_V2_AAD = 2;
+export const FORMAT_VERSION_V4_ARTIFACT = 4;
 const CURRENT_FORMAT_VERSION = FORMAT_VERSION_V2_AAD;
 const PBKDF2_ITERATIONS = 600_000;
 const SALT_BYTES = 16;
@@ -139,6 +149,12 @@ export async function unsealText(
   }
 
   const version = blob[0];
+  if (version === FORMAT_VERSION_V4_ARTIFACT) {
+    // A version-4 plaintext is an envelope followed by raw file bytes, not
+    // UTF-8 — decoding it as text would hand back garbage instead of
+    // saying what this relic actually is. Refused before any PBKDF2 work.
+    throw new Error("This relic holds a file, not text — unseal it as a file.");
+  }
   if (
     version !== FORMAT_VERSION_V1_NO_AAD &&
     version !== FORMAT_VERSION_V2_AAD
@@ -540,4 +556,223 @@ export async function unsealMultiKey(
   cek.fill(0);
 
   return new TextDecoder().decode(plaintext);
+}
+
+// --- Artifacts (image, audio, any file) — format version 4 ---
+//
+// See docs/encryption-spec.md, "Version 4". Same 33-byte header and the same
+// header-as-AAD binding as version 2; the only difference is what the
+// plaintext is: a self-describing envelope, so the mime type and file name
+// travel *inside* the encryption and the relic stays decryptable without
+// RelicONE's database:
+//
+//   mime length (1 byte) | mime (UTF-8) | name length (1 byte) | name
+//   (UTF-8) | raw file bytes (the rest)
+//
+// `sealText`/`unsealText`/`sealMultiKey`/`unsealMultiKey` are untouched.
+
+/** Both envelope length fields are one byte, so each string is capped at 255 UTF-8 bytes. */
+export const MAX_ARTIFACT_MIME_BYTES = 255;
+export const MAX_ARTIFACT_FILE_NAME_BYTES = 255;
+// Longest extension (including the dot) kept intact when a file name has to
+// be shortened — see fitArtifactFileName.
+const MAX_PRESERVED_EXTENSION_BYTES = 32;
+
+export type UnsealedArtifact = {
+  bytes: Uint8Array;
+  mimeType: string;
+  fileName: string;
+};
+
+/**
+ * Cuts `text` to at most `maxBytes` UTF-8 bytes without ever splitting a
+ * character (code point) in the middle.
+ */
+export function truncateUtf8(text: string, maxBytes: number): string {
+  const encoder = new TextEncoder();
+  if (encoder.encode(text).length <= maxBytes) return text;
+
+  let result = "";
+  let used = 0;
+  for (const character of text) {
+    const size = encoder.encode(character).length;
+    if (used + size > maxBytes) break;
+    result += character;
+    used += size;
+  }
+  return result;
+}
+
+/**
+ * Returns `fileName` unchanged if it fits the envelope's 255-byte field,
+ * otherwise a shortened version. Shortened, not rejected: the name is
+ * advisory metadata, and refusing to seal a file because of an unusually
+ * long name would block something unrelated to its content. The extension
+ * (up to 32 bytes including the dot) is kept so the downloaded file still
+ * opens with the right program; the stem is cut on a character boundary.
+ */
+export function fitArtifactFileName(fileName: string): string {
+  const encoder = new TextEncoder();
+  if (encoder.encode(fileName).length <= MAX_ARTIFACT_FILE_NAME_BYTES) return fileName;
+
+  const dot = fileName.lastIndexOf(".");
+  if (dot > 0) {
+    const extension = fileName.slice(dot);
+    const extensionBytes = encoder.encode(extension).length;
+    if (extensionBytes <= MAX_PRESERVED_EXTENSION_BYTES) {
+      return (
+        truncateUtf8(fileName.slice(0, dot), MAX_ARTIFACT_FILE_NAME_BYTES - extensionBytes) +
+        extension
+      );
+    }
+  }
+  return truncateUtf8(fileName, MAX_ARTIFACT_FILE_NAME_BYTES);
+}
+
+function packArtifactEnvelope(
+  bytes: Uint8Array,
+  mimeType: string,
+  fileName: string,
+): Uint8Array {
+  const encoder = new TextEncoder();
+  const mime = encoder.encode(mimeType);
+  if (mime.length > MAX_ARTIFACT_MIME_BYTES) {
+    throw new Error(
+      `The file's type is too long to store (${mime.length} bytes, maximum ${MAX_ARTIFACT_MIME_BYTES}).`,
+    );
+  }
+  const name = encoder.encode(fitArtifactFileName(fileName));
+
+  const envelope = new Uint8Array(1 + mime.length + 1 + name.length + bytes.length);
+  let offset = 0;
+  envelope[offset++] = mime.length;
+  envelope.set(mime, offset);
+  offset += mime.length;
+  envelope[offset++] = name.length;
+  envelope.set(name, offset);
+  offset += name.length;
+  envelope.set(bytes, offset);
+  return envelope;
+}
+
+function unpackArtifactEnvelope(envelope: Uint8Array): UnsealedArtifact {
+  const invalid = () =>
+    new Error("This isn't a valid sealed file — its contents are malformed.");
+  // Lenient decoding on purpose: this runs only after the GCM tag already
+  // verified, so a bad byte sequence in a name is a quirk of whoever sealed
+  // it, and the file bytes (the thing worth recovering) must still come out.
+  const decoder = new TextDecoder();
+
+  if (envelope.length < 2) throw invalid();
+  let offset = 0;
+  const mimeLength = envelope[offset++];
+  if (offset + mimeLength + 1 > envelope.length) throw invalid();
+  const mimeType = decoder.decode(envelope.subarray(offset, offset + mimeLength));
+  offset += mimeLength;
+
+  const nameLength = envelope[offset++];
+  if (offset + nameLength > envelope.length) throw invalid();
+  const fileName = decoder.decode(envelope.subarray(offset, offset + nameLength));
+  offset += nameLength;
+
+  return { bytes: envelope.slice(offset), mimeType, fileName };
+}
+
+/**
+ * Encrypts one file (any bytes) with a key derived from `passphrase` and
+ * returns the self-contained version-4 blob. The mime type and file name go
+ * inside the encrypted envelope, never beside it. The passphrase is never
+ * returned, stored, or transmitted. A file name over 255 UTF-8 bytes is
+ * shortened (see fitArtifactFileName); a mime type over 255 bytes is
+ * rejected. An empty file name is valid.
+ */
+export async function sealArtifact(
+  bytes: Uint8Array,
+  mimeType: string,
+  fileName: string,
+  passphrase: string,
+): Promise<Uint8Array> {
+  assertBrowserCrypto();
+
+  const envelope = packArtifactEnvelope(bytes, mimeType, fileName);
+
+  const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
+  const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
+  const key = await deriveKey(passphrase, salt, PBKDF2_ITERATIONS);
+
+  const header = new Uint8Array(HEADER_LENGTH);
+  header[0] = FORMAT_VERSION_V4_ARTIFACT;
+  new DataView(header.buffer).setUint32(1, PBKDF2_ITERATIONS, false);
+  header.set(salt, 5);
+  header.set(iv, 5 + SALT_BYTES);
+
+  const ciphertext = new Uint8Array(
+    await crypto.subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv: iv as BufferSource,
+        additionalData: header as BufferSource,
+      },
+      key,
+      envelope as BufferSource,
+    ),
+  );
+
+  const blob = new Uint8Array(header.length + ciphertext.length);
+  blob.set(header, 0);
+  blob.set(ciphertext, header.length);
+  return blob;
+}
+
+/**
+ * Reverses `sealArtifact`. Accepts version-4 blobs only; the returned bytes
+ * are untrusted content and must never be rendered inline as HTML/SVG by
+ * the caller — offer a download instead. Same pre-checks as `unsealText`
+ * (minimum length, plausible iteration count), because this too runs on
+ * whatever an arbitrary Arweave transaction contains.
+ */
+export async function unsealArtifact(
+  blob: Uint8Array,
+  passphrase: string,
+): Promise<UnsealedArtifact> {
+  assertBrowserCrypto();
+
+  if (blob.byteLength < HEADER_LENGTH + GCM_TAG_BYTES) {
+    throw new Error("This isn't a valid sealed relic — the data is too short.");
+  }
+
+  const version = blob[0];
+  if (version === FORMAT_VERSION_V1_NO_AAD || version === FORMAT_VERSION_V2_AAD) {
+    throw new Error("This relic holds text, not a file.");
+  }
+  if (version !== FORMAT_VERSION_V4_ARTIFACT) {
+    throw new Error(`Unsupported sealed relic format version: ${version}`);
+  }
+
+  const iterations = new DataView(
+    blob.buffer,
+    blob.byteOffset,
+    blob.byteLength,
+  ).getUint32(1, false);
+  if (iterations === 0 || iterations > MAX_PLAUSIBLE_PBKDF2_ITERATIONS) {
+    throw new Error("This isn't a valid sealed relic — its iteration count is implausible.");
+  }
+
+  const header = blob.slice(0, HEADER_LENGTH);
+  const salt = blob.slice(5, 5 + SALT_BYTES);
+  const iv = blob.slice(5 + SALT_BYTES, 5 + SALT_BYTES + IV_BYTES);
+  const ciphertext = blob.slice(HEADER_LENGTH);
+
+  const key = await deriveKey(passphrase, salt, iterations);
+  const envelope = await crypto.subtle.decrypt(
+    {
+      name: "AES-GCM",
+      iv: iv as BufferSource,
+      additionalData: header as BufferSource,
+    },
+    key,
+    ciphertext as BufferSource,
+  );
+
+  return unpackArtifactEnvelope(new Uint8Array(envelope));
 }

@@ -14,8 +14,9 @@ manual primitives, Node `crypto`, Python `cryptography`, ...).
 
 ## Format versions
 
-Two versions of the blob format exist, distinguished by the version byte
-described below:
+Two versions of the text blob format exist (plus the file format, version
+4, described at the end), distinguished by the version byte described
+below:
 
 - **Version 1** — the original format. The header (version, iterations,
   salt, IV) sits next to the ciphertext but is **not** cryptographically
@@ -34,6 +35,11 @@ described below:
 A reader decrypting an existing relic must read the version byte first and
 follow the matching Unsealing path below — the two versions decrypt
 differently.
+
+**A fourth version, version 4, seals a file instead of text.** It has the
+same header and the same AAD binding as version 2; only the meaning of the
+decrypted bytes differs (see "Version 4 — files (artifacts)" at the end of
+this document).
 
 **A third format, version 3, exists but is documented separately:**
 [`multi-key-encryption-spec.md`](./multi-key-encryption-spec.md) specifies
@@ -136,8 +142,11 @@ decryptable — see Unsealing below.
 
 1. Download the Arweave transaction's content
    (`https://arweave.net/<tx-id>` or any other Arweave gateway).
-2. Read the first byte — the **version**. Must be `0x01` or `0x02`;
-   anything else is an unsupported format and decryption must stop here.
+2. Read the first byte — the **version**. For text it must be `0x01` or
+   `0x02`; `0x04` is a file relic (see "Version 4" below — steps 3–6 and
+   the AAD rule are identical, only step 7's result is parsed
+   differently); anything else is an unsupported format and decryption
+   must stop here.
 3. Read the next 4 bytes as a big-endian `uint32` — the iteration count.
 4. Read the next 16 bytes as the salt, the next 12 bytes as the IV.
 5. The rest of the blob is the ciphertext (including the GCM tag). The
@@ -186,3 +195,57 @@ running PBKDF2 based on the header just read, it's recommended to verify:
 
 Both checks apply only on the decryption side — they change nothing
 about the blob format or what `sealText` writes.
+
+## Version 4 — files (artifacts)
+
+Version 4 seals one file (an image, audio, any bytes) instead of text. The
+outer blob is **byte-for-byte the same layout as version 2** — same 33-byte
+header with `version = 0x04`, same PBKDF2 parameters, same AES-256-GCM, and
+the **33-byte header is passed as AAD**, exactly as in version 2. Sealing
+and unsealing differ in one respect only: what the plaintext is.
+
+The plaintext is a small self-describing **envelope**, so the file's type
+and name travel inside the encryption (they are never in the Arweave tags
+and do not depend on any database):
+
+```
++-----------+-----------+-----------+-----------+------------------+
+| mime len  | mime type | name len  | file name | file bytes       |
+| 1 byte    | N bytes   | 1 byte    | M bytes   | rest of plaintext|
+| (uint8 N) | UTF-8     | (uint8 M) | UTF-8     |                  |
++-----------+-----------+-----------+-----------+------------------+
+```
+
+- **mime len** (`uint8`) — byte length N of the mime type, 0–255.
+- **mime type** — UTF-8, e.g. `image/jpeg` (may carry parameters, e.g.
+  `audio/webm;codecs=opus`). A writer must not produce more than 255 bytes.
+- **name len** (`uint8`) — byte length M of the file name, 0–255. **0 is
+  valid** (no name).
+- **file name** — UTF-8, the original file name. A writer whose name exceeds
+  255 bytes shortens it on a character boundary (RelicONE keeps the
+  extension and cuts the stem); it is advisory only.
+- **file bytes** — everything after the name, up to the end of the
+  decrypted plaintext; may be empty.
+
+The offsets are therefore: mime at `1`, name length at `1 + N`, name at
+`2 + N`, file bytes at `2 + N + M`. A reader should reject a plaintext in
+which `1 + N + 1 + M` exceeds the plaintext length.
+
+### Sealing a file
+
+As "Sealing (encryption)" above, with: header byte 0 is `0x04`; the AES-GCM
+plaintext is the envelope instead of UTF-8 text; the header is AAD. The
+sealed blob is `33 + (1 + N + 1 + M + file size) + 16` bytes — GCM adds no
+padding — which is how RelicONE computes exactly how large a file fits.
+
+### Unsealing a file
+
+Steps 1–6 of "Unsealing (decryption)" unchanged. Step 7: decrypt with
+AES-256-GCM using the 33-byte header as AAD (as version 2), then parse the
+envelope above. **Treat the result as untrusted content:** the file name and
+type come from whoever sealed the relic. Do not render the bytes as HTML/SVG
+or open them automatically; offer a download, and sanitise the file name
+(path separators, control characters, leading dots) before using it as one.
+
+A reader that only handles text should refuse `0x04` explicitly rather than
+decode the envelope and file bytes as UTF-8.
